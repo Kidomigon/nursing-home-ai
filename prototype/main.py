@@ -1,29 +1,32 @@
-"""FastAPI prototype for nursing-home AI alerts
+"""FastAPI prototype for Room Companion — nursing home AI assistant.
 
-Phase 1: single-room prototype with:
-- /api/alerts endpoints
-- /room (resident UI, stubbed)
-- /staff (staff portal, simple alert list)
+Features:
+- LLM-powered conversational chat per room
+- Intent classification with severity levels
+- Real-time alert management for staff
+- Multi-room support with resident profiles
+- Voice input/output (handled client-side)
 """
+
+import asyncio
 from datetime import datetime
 import datetime as dt
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 import sqlite3
 
+from llm import load_api_keys, chat, classify, get_greeting, ClassificationResult
+
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "alerts.db"
 
-app = FastAPI(title="Nursing Home AI Prototype")
-
-# In-memory store for last answer per room (prototype only)
-LAST_ANSWERS = {}
+app = FastAPI(title="Room Companion")
 
 # Static files & templates
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -31,7 +34,7 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 # ==========================
-# Database helpers (simple)
+# Database helpers
 # ==========================
 
 def init_db():
@@ -46,6 +49,7 @@ def init_db():
             type TEXT NOT NULL,
             message TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'new',
+            severity TEXT NOT NULL DEFAULT 'routine',
             created_at TEXT NOT NULL,
             acknowledged_at TEXT,
             resolved_at TEXT
@@ -53,7 +57,6 @@ def init_db():
         """
     )
 
-    # Questions table: log resident questions for future trend analysis
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS questions (
@@ -61,10 +64,23 @@ def init_db():
             room_id TEXT NOT NULL,
             resident_name TEXT NOT NULL,
             question TEXT NOT NULL,
+            response TEXT,
             created_at TEXT NOT NULL
         )
         """
     )
+
+    # Migration: add severity column if missing (existing DBs)
+    cursor.execute("PRAGMA table_info(alerts)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "severity" not in columns:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN severity TEXT NOT NULL DEFAULT 'routine'")
+
+    # Migration: add response column to questions if missing
+    cursor.execute("PRAGMA table_info(questions)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "response" not in columns:
+        cursor.execute("ALTER TABLE questions ADD COLUMN response TEXT")
 
     conn.commit()
     conn.close()
@@ -78,18 +94,19 @@ def get_db_connection():
 
 # Run at startup
 init_db()
+load_api_keys()
 
 
 # ==========================
 # API models
 # ==========================
 
-
 class AlertCreate(BaseModel):
     room_id: str
     resident_name: str
     type: str
     message: str
+    severity: str = "routine"
     timestamp: Optional[str] = None
 
 
@@ -100,49 +117,85 @@ class Alert(BaseModel):
     type: str
     message: str
     status: str
+    severity: str
     created_at: str
     acknowledged_at: Optional[str]
     resolved_at: Optional[str]
+
+
+class ChatRequest(BaseModel):
+    message: str
+
+
+class ChatResponse(BaseModel):
+    response: str
+    alert_created: bool
+    severity: Optional[str] = None
+
+
+# ==========================
+# Resident profiles
+# ==========================
+
+RESIDENT_PROFILES = {
+    "101": {
+        "resident_name": "Margaret",
+        "mode": "standard",
+    },
+    "102": {
+        "resident_name": "Harold",
+        "mode": "memory_support",
+    },
+    "103": {
+        "resident_name": "Dorothy",
+        "mode": "standard",
+    },
+}
 
 
 # ==========================
 # API endpoints
 # ==========================
 
-
 @app.post("/api/alerts", response_model=Alert)
 def create_alert(alert: AlertCreate):
-    """Create a new alert (called by the room UI or device)."""
+    """Create a new alert."""
     now_str = alert.timestamp or datetime.utcnow().isoformat()
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """INSERT INTO alerts
-               (room_id, resident_name, type, message, status, created_at)
-               VALUES (?, ?, ?, ?, 'new', ?)""",
-        (alert.room_id, alert.resident_name, alert.type, alert.message, now_str),
+               (room_id, resident_name, type, message, status, severity, created_at)
+               VALUES (?, ?, ?, ?, 'new', ?, ?)""",
+        (alert.room_id, alert.resident_name, alert.type, alert.message, alert.severity, now_str),
     )
     conn.commit()
     alert_id = cursor.lastrowid
-
     cursor.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,))
     row = cursor.fetchone()
     conn.close()
-
     return Alert(**dict(row))
 
 
 @app.get("/api/alerts", response_model=List[Alert])
-def list_alerts(status: Optional[str] = None):
-    """List alerts, optionally filtered by status."""
+def list_alerts(status: Optional[str] = None, room_id: Optional[str] = None):
+    """List alerts, optionally filtered by status or room."""
     conn = get_db_connection()
     cursor = conn.cursor()
-
+    conditions = []
+    params = []
     if status:
-        cursor.execute("SELECT * FROM alerts WHERE status = ? ORDER BY created_at DESC", (status,))
-    else:
-        cursor.execute("SELECT * FROM alerts ORDER BY created_at DESC")
-
+        conditions.append("status = ?")
+        params.append(status)
+    if room_id:
+        conditions.append("room_id = ?")
+        params.append(room_id)
+    where = " AND ".join(conditions)
+    query = "SELECT * FROM alerts"
+    if where:
+        query += f" WHERE {where}"
+    query += " ORDER BY created_at DESC"
+    cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
     return [Alert(**dict(row)) for row in rows]
@@ -155,13 +208,11 @@ def acknowledge_alert(alert_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        """UPDATE alerts
-               SET status = 'ack', acknowledged_at = ?
-               WHERE id = ? AND status = 'new'""",
+        """UPDATE alerts SET status = 'ack', acknowledged_at = ?
+           WHERE id = ? AND status = 'new'""",
         (now_str, alert_id),
     )
     conn.commit()
-
     cursor.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,))
     row = cursor.fetchone()
     conn.close()
@@ -175,71 +226,150 @@ def resolve_alert(alert_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        """UPDATE alerts
-               SET status = 'resolved', resolved_at = ?
-               WHERE id = ?""",
+        """UPDATE alerts SET status = 'resolved', resolved_at = ?
+           WHERE id = ?""",
         (now_str, alert_id),
     )
     conn.commit()
-
     cursor.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,))
     row = cursor.fetchone()
     conn.close()
     return Alert(**dict(row))
 
 
+@app.get("/api/alerts/summary")
+def alerts_summary():
+    """Per-room summary: help counts (30m), orientation counts (7d), active alerts."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    summary = {}
+
+    for room_id, profile in RESIDENT_PROFILES.items():
+        # Help alert count (last 30 min)
+        cursor.execute(
+            """SELECT COUNT(*) FROM alerts
+               WHERE room_id = ? AND type = 'help'
+               AND datetime(created_at) >= datetime('now', '-30 minutes')""",
+            (room_id,),
+        )
+        help_count = cursor.fetchone()[0]
+
+        # Orientation question count (last 7 days)
+        cursor.execute(
+            """SELECT COUNT(*) FROM questions
+               WHERE room_id = ?
+               AND datetime(created_at) >= datetime('now', '-7 days')
+               AND (lower(question) LIKE '%where am i%'
+                    OR lower(question) LIKE '%what time%'
+                    OR lower(question) LIKE '%what day%')""",
+            (room_id,),
+        )
+        orientation_count = cursor.fetchone()[0]
+
+        # Active (unresolved) alerts count
+        cursor.execute(
+            """SELECT COUNT(*) FROM alerts
+               WHERE room_id = ? AND status != 'resolved'""",
+            (room_id,),
+        )
+        active_count = cursor.fetchone()[0]
+
+        # Most recent alert severity
+        cursor.execute(
+            """SELECT severity FROM alerts
+               WHERE room_id = ? AND status != 'resolved'
+               ORDER BY created_at DESC LIMIT 1""",
+            (room_id,),
+        )
+        row = cursor.fetchone()
+        latest_severity = row[0] if row else None
+
+        summary[room_id] = {
+            "resident_name": profile["resident_name"],
+            "mode": profile["mode"],
+            "help_count_30m": help_count,
+            "orientation_count_7d": orientation_count,
+            "active_alerts": active_count,
+            "latest_severity": latest_severity,
+        }
+
+    conn.close()
+    return summary
+
+
 # ==========================
-# Resident profile / modes
+# Chat endpoint (LLM-powered)
 # ==========================
 
-# Simple multi-room profile map for the prototype
-RESIDENT_PROFILES = {
-    "101": {
-        "resident_name": "Resident 101",
-        "mode": "standard",
-    },
-    "102": {
-        "resident_name": "Resident 102",
-        "mode": "memory_support",
-    },
-    "103": {
-        "resident_name": "Resident 103",
-        "mode": "standard",
-    },
-}
+@app.post("/api/room/{room_id}/chat", response_model=ChatResponse)
+async def room_chat(room_id: str, req: ChatRequest):
+    """Send a message to the Room Companion and get a response.
 
-HELP_KEYWORDS = [
-    "help",
-    "fell",
-    "fall",
-    "nurse",
-    "hurt",
-    "pain",
-    "emergency",
-]
-
-
-# ==========================
-# HTML views (Phase 1 + simple modes)
-# ==========================
-
-
-@app.get("/room/{room_id}", response_class=HTMLResponse)
-async def room_view(request: Request, room_id: str):
-    """Room UI representing the resident device for a given room.
-
-    Now supports multiple rooms via the path parameter.
+    Runs LLM chat and classification in parallel.
+    Creates alert if classification detects a help request.
     """
     profile = RESIDENT_PROFILES.get(room_id)
     if not profile:
-        # Unknown room id
+        return JSONResponse({"error": "Unknown room"}, status_code=404)
+
+    resident_name = profile["resident_name"]
+    mode = profile["mode"]
+    user_message = req.message.strip()
+
+    if not user_message:
+        return ChatResponse(response="I didn't catch that. Could you say that again?", alert_created=False)
+
+    # Run chat and classify in parallel
+    chat_task = chat(room_id, resident_name, mode, user_message)
+    classify_task = classify(user_message)
+    response_text, classification = await asyncio.gather(chat_task, classify_task)
+
+    # Log the question + response
+    now_str = datetime.utcnow().isoformat()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO questions (room_id, resident_name, question, response, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (room_id, resident_name, user_message, response_text, now_str),
+    )
+
+    # Create alert if help request detected
+    alert_created = False
+    severity = None
+    if classification.is_help_request and classification.confidence >= 0.5 and classification.severity != "informational":
+        severity = classification.severity
+        cursor.execute(
+            """INSERT INTO alerts
+                   (room_id, resident_name, type, message, status, severity, created_at)
+                   VALUES (?, ?, 'help', ?, 'new', ?, ?)""",
+            (room_id, resident_name, f"[{classification.severity}] {user_message}", severity, now_str),
+        )
+        alert_created = True
+
+    conn.commit()
+    conn.close()
+
+    return ChatResponse(response=response_text, alert_created=alert_created, severity=severity)
+
+
+# ==========================
+# HTML views
+# ==========================
+
+@app.get("/room/{room_id}", response_class=HTMLResponse)
+async def room_view(request: Request, room_id: str):
+    """Room UI — resident-facing chat interface."""
+    profile = RESIDENT_PROFILES.get(room_id)
+    if not profile:
         return HTMLResponse(content=f"Unknown room: {room_id}", status_code=404)
 
     resident_name = profile["resident_name"]
     mode = profile["mode"]
-
-    last_answer = LAST_ANSWERS.get(room_id)
+    greeting = get_greeting(room_id, resident_name, mode)
     current_day = dt.datetime.now().strftime("%A")
+    current_time = dt.datetime.now().strftime("%I:%M %p").lstrip("0")
+    current_date = dt.datetime.now().strftime("%B %d, %Y")
 
     return templates.TemplateResponse(
         "room.html",
@@ -248,132 +378,99 @@ async def room_view(request: Request, room_id: str):
             "room_id": room_id,
             "resident_name": resident_name,
             "mode": mode,
-            "last_answer": last_answer,
+            "greeting": greeting,
             "current_day": current_day,
+            "current_time": current_time,
+            "current_date": current_date,
         },
     )
 
 
 @app.post("/room/{room_id}/help")
 async def room_call_help(room_id: str, resident_name: str = Form(...)):
-    """Handle 'Call for Help' button from room UI."""
+    """Handle 'Call for Help' button — creates emergency alert."""
     alert = AlertCreate(
         room_id=room_id,
         resident_name=resident_name,
         type="help",
         message="Resident requested help via button",
+        severity="emergency",
     )
     create_alert(alert)
-    return RedirectResponse(url=f"/room/{room_id}", status_code=303)
-
-
-@app.post("/room/{room_id}/question")
-async def room_question(
-    room_id: str,
-    question: str = Form(""),
-    resident_name: str = Form(...)
-):
-    """Handle 'Ask a Question'.
-
-    Current behavior:
-    - Log every question to the questions table.
-    - If the text looks like a help/distress request, create a help alert.
-    - Generate a simple canned response for common questions (time, meals, location)
-      and store it in LAST_ANSWERS.
-    """
-    raw_question = (question or "").strip()
-    text = raw_question.lower()
-    now_str = datetime.utcnow().isoformat()
-
-    # Log question
-    if raw_question:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            """INSERT INTO questions (room_id, resident_name, question, created_at)
-                   VALUES (?, ?, ?, ?)""",
-            (room_id, resident_name, raw_question, now_str),
-        )
-        conn.commit()
-        conn.close()
-
-    # Simple keyword-based help detection
-    if any(keyword in text for keyword in HELP_KEYWORDS):
-        alert = AlertCreate(
-            room_id=room_id,
-            resident_name=resident_name,
-            type="help",
-            message=f"Possible distress from question input: '{raw_question}'",
-        )
-        create_alert(alert)
-
-    # Simple canned responses
-    answer = ""
-    if text:
-        if "where am i" in text or "what is this place" in text or "where is my room" in text:
-            answer = f"You are in Room {room_id}."
-        elif "time" in text:
-            # Use local time string
-            answer = f"It is now {datetime.now().strftime('%I:%M %p').lstrip('0')}"
-        elif "breakfast" in text or "lunch" in text or "dinner" in text or "meal" in text:
-            # Hard-coded schedule for prototype
-            answer = "Breakfast is at 8:00 AM, lunch at 12:00 PM, and dinner at 5:30 PM."
-
-    if answer:
-        LAST_ANSWERS[room_id] = answer
-
-    return RedirectResponse(url=f"/room/{room_id}", status_code=303)
+    return RedirectResponse(url=f"/room/{room_id}?helped=1", status_code=303)
 
 
 @app.get("/staff", response_class=HTMLResponse)
-async def staff_view(request: Request, room_id: Optional[str] = None):
-    """Simple staff portal showing alerts, optionally filtered by room.
-
-    Also computes a simple summary of help alerts in the last 30 minutes per room.
-    """
+async def staff_view(request: Request, room_id: Optional[str] = None, severity: Optional[str] = None, status: Optional[str] = None):
+    """Staff portal — alert dashboard with room status cards."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Main alert list (optionally filtered)
+    # Build filter query
+    conditions = []
+    params = []
     if room_id:
-        cursor.execute("SELECT * FROM alerts WHERE room_id = ? ORDER BY created_at DESC", (room_id,))
-    else:
-        cursor.execute("SELECT * FROM alerts ORDER BY created_at DESC")
+        conditions.append("room_id = ?")
+        params.append(room_id)
+    if severity:
+        conditions.append("severity = ?")
+        params.append(severity)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+
+    where = " AND ".join(conditions)
+    query = "SELECT * FROM alerts"
+    if where:
+        query += f" WHERE {where}"
+    query += " ORDER BY created_at DESC LIMIT 100"
+
+    cursor.execute(query, params)
     rows = cursor.fetchall()
 
-    # Help alert counts in last 30 minutes per room (using SQLite time functions)
-    cursor2 = conn.cursor()
+    # Room summary data
     room_help_counts = {}
     room_orientation_counts = {}
-    for rid in RESIDENT_PROFILES.keys():
-        # Help counts
-        cursor2.execute(
-            """SELECT COUNT(*) FROM alerts
-                   WHERE room_id = ? AND type = 'help'
-                   AND datetime(created_at) >= datetime('now', '-30 minutes')""",
-            (rid,),
-        )
-        count_row = cursor2.fetchone()
-        room_help_counts[rid] = count_row[0] if count_row else 0
+    room_active_alerts = {}
+    room_latest_severity = {}
 
-        # Orientation confusion counts (last 7 days)
-        cursor2.execute(
-            """SELECT COUNT(*) FROM questions
-                   WHERE room_id = ?
-                   AND datetime(created_at) >= datetime('now', '-7 days')
-                   AND (lower(question) LIKE '%where am i%'
-                        OR lower(question) LIKE '%what time%'
-                        OR lower(question) LIKE '%what day%')""",
+    for rid in RESIDENT_PROFILES.keys():
+        cursor.execute(
+            """SELECT COUNT(*) FROM alerts
+               WHERE room_id = ? AND type = 'help'
+               AND datetime(created_at) >= datetime('now', '-30 minutes')""",
             (rid,),
         )
-        orient_row = cursor2.fetchone()
-        room_orientation_counts[rid] = orient_row[0] if orient_row else 0
+        room_help_counts[rid] = cursor.fetchone()[0]
+
+        cursor.execute(
+            """SELECT COUNT(*) FROM questions
+               WHERE room_id = ?
+               AND datetime(created_at) >= datetime('now', '-7 days')
+               AND (lower(question) LIKE '%where am i%'
+                    OR lower(question) LIKE '%what time%'
+                    OR lower(question) LIKE '%what day%')""",
+            (rid,),
+        )
+        room_orientation_counts[rid] = cursor.fetchone()[0]
+
+        cursor.execute(
+            """SELECT COUNT(*) FROM alerts WHERE room_id = ? AND status != 'resolved'""",
+            (rid,),
+        )
+        room_active_alerts[rid] = cursor.fetchone()[0]
+
+        cursor.execute(
+            """SELECT severity FROM alerts WHERE room_id = ? AND status != 'resolved'
+               ORDER BY created_at DESC LIMIT 1""",
+            (rid,),
+        )
+        sev_row = cursor.fetchone()
+        room_latest_severity[rid] = sev_row[0] if sev_row else None
 
     conn.close()
 
     alerts = [dict(row) for row in rows]
-
-    # Enrich alerts with mode info from RESIDENT_PROFILES
     for alert in alerts:
         profile = RESIDENT_PROFILES.get(alert["room_id"], {})
         alert["mode"] = profile.get("mode", "standard")
@@ -382,8 +479,14 @@ async def staff_view(request: Request, room_id: Optional[str] = None):
         "staff.html", {
             "request": request,
             "alerts": alerts,
+            "profiles": RESIDENT_PROFILES,
             "room_help_counts": room_help_counts,
             "room_orientation_counts": room_orientation_counts,
+            "room_active_alerts": room_active_alerts,
+            "room_latest_severity": room_latest_severity,
+            "filter_room": room_id or "",
+            "filter_severity": severity or "",
+            "filter_status": status or "",
         }
     )
 
@@ -400,8 +503,6 @@ async def staff_resolve_alert(alert_id: int):
     return RedirectResponse(url="/staff", status_code=303)
 
 
-# Root redirect
 @app.get("/")
 async def root():
-    # Default to room 101 for now
     return RedirectResponse(url="/room/101")

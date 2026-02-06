@@ -2,56 +2,92 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Resident Room – Prototype</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Room {{ room_id }} — {{ resident_name }}</title>
   <link rel="stylesheet" href="/static/style.css" />
-  <script defer src="/static/voice.js"></script>
 </head>
-<body class="room">
-  <div class="container">
-    <h1>Room {{ room_id }}</h1>
-    <h2>{{ resident_name }}</h2>
-    <p class="note">Mode: {% if mode == 'memory_support' %}Memory Support{% else %}Standard{% endif %}</p>
-    <div id="voice-banner" class="voice-banner" style="display:none;">
-      <span id="voice-banner-text">Listening...</span>
+<body>
+  <div class="room-layout">
+
+    <!-- Orientation Bar -->
+    <header class="orientation-bar">
+      <div>
+        <div class="room-label">Room {{ room_id }}</div>
+        <div class="resident-name">{{ resident_name }}</div>
+      </div>
+      <div class="clock-area">
+        <div class="clock-time" id="live-clock">{{ current_time }}</div>
+        <div class="clock-date" id="live-date">{{ current_day }}, {{ current_date }}</div>
+      </div>
+    </header>
+
+    <!-- Call for Help -->
+    <div class="help-section">
+      <form id="help-form" method="post" action="/room/{{ room_id }}/help">
+        <input type="hidden" name="resident_name" value="{{ resident_name }}" />
+        <button type="submit" class="help-btn" id="help-btn">Call for Help</button>
+      </form>
     </div>
 
     {% if mode == 'memory_support' %}
-    <div class="card">
-      <p><strong>You are in your room at your care home.</strong></p>
-      <p class="note">It is {{ current_day }}. This helper can remind you where you are, what time it is, and when meals and activities happen.</p>
+    <!-- Memory Support Orientation -->
+    <div class="memory-card">
+      <strong>You are in Room {{ room_id }} at your care home.</strong>
+      It is {{ current_day }}. I'm here to help you with anything you need.
     </div>
     {% endif %}
 
-    <div class="card">
-      <h3>Need Help?</h3>
-      <form method="post" action="/room/{{ room_id }}/help">
-        <input type="hidden" name="resident_name" value="{{ resident_name }}" />
-        <button type="submit" class="btn btn-danger btn-large">Call for Help</button>
-      </form>
-    </div>
-
-    <div class="card">
-      <h3>Ask a Question</h3>
-      {% if mode == 'memory_support' %}
-      <p class="note">You can ask things like "Where am I?", "What time is it?", or "When is my next meal?"</p>
-      <p class="note"><label><input type="checkbox" id="auto-send-voice" /> Send automatically when I stop speaking</label></p>
-      {% endif %}
-      <form method="post" action="/room/{{ room_id }}/question">
-        <input type="hidden" name="resident_name" value="{{ resident_name }}" />
-        <textarea id="question-input" name="question" rows="3" placeholder="You can type or use the microphone to ask a question."></textarea>
-        <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; align-items: center;">
-          <button type="submit" class="btn">Send</button>
-          <button id="voice-btn" class="btn" type="button">🎤 Speak</button>
-          <span id="voice-support-note" class="note"></span>
+    <!-- Chat Area -->
+    <div class="chat-area" id="chat-messages">
+      <!-- Thinking indicator (hidden by default) -->
+      <div class="thinking-indicator" id="thinking-indicator">
+        <div class="thinking-dots">
+          <span></span><span></span><span></span>
         </div>
-      </form>
-      {% if last_answer %}
-      <p class="note"><strong>Last answer:</strong> {{ last_answer }}</p>
-      {% endif %}
-      <p class="note">(Some questions may create a help alert if they sound like distress.)</p>
+        Room Companion is thinking...
+      </div>
+      <div class="slow-thinking" id="slow-thinking">Still thinking, one moment...</div>
     </div>
 
-    <p class="link"><a href="/staff">Go to staff view</a></p>
+    <!-- Input Bar -->
+    <div class="input-bar">
+      <button class="icon-btn mute-btn" id="mute-btn" type="button" aria-label="Mute voice">
+        <span class="mute-icon">&#x1F50A;</span>
+      </button>
+      <div class="mic-indicator" id="mic-indicator">
+        <div class="bar"></div>
+        <div class="bar"></div>
+        <div class="bar"></div>
+        <div class="bar"></div>
+      </div>
+      <input type="text" id="chat-input" placeholder="Type a message or tap the mic..." autocomplete="off" />
+      <button class="icon-btn mic-btn" id="mic-btn" type="button" aria-label="Start voice input">&#x1F3A4;</button>
+      <button class="icon-btn send-btn" id="send-btn" type="button" aria-label="Send message">&#x27A4;</button>
+    </div>
+
+    <div class="room-nav">
+      <a href="/staff">Staff Portal</a>
+    </div>
+
   </div>
+
+  <!-- Help Confirmation Overlay -->
+  <div class="help-overlay" id="help-overlay">
+    <div class="help-overlay-icon">&#x2705;</div>
+    <div class="help-overlay-text">Help is on the way</div>
+    <div class="help-overlay-severity"></div>
+  </div>
+
+  <!-- Config for JS -->
+  <script>
+    window.ROOM_CONFIG = {
+      roomId: "{{ room_id }}",
+      residentName: "{{ resident_name }}",
+      mode: "{{ mode }}",
+      greeting: "{{ greeting | e }}"
+    };
+  </script>
+  <script src="/static/voice.js"></script>
+  <script src="/static/app.js"></script>
 </body>
 </html>

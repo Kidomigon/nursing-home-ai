@@ -2,99 +2,135 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Staff Portal – Prototype</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Staff Portal — Room Companion</title>
   <link rel="stylesheet" href="/static/style.css" />
-  <meta http-equiv="refresh" content="10" />
+  <meta http-equiv="refresh" content="15" />
 </head>
-<body class="staff">
-  <div class="container">
-    <h1>Staff Portal</h1>
-    <p class="note">Prototype view – refreshes every 10 seconds.</p>
+<body>
+  <div class="staff-layout">
 
-    <p class="note">Rooms: 
-      <a href="/room/101">101</a> |
-      <a href="/room/102">102</a> |
-      <a href="/room/103">103</a>
-      &nbsp;|&nbsp; View alerts for:
-      <a href="/staff">All</a> /
-      <a href="/staff?room_id=101">101</a> /
-      <a href="/staff?room_id=102">102</a> /
-      <a href="/staff?room_id=103">103</a>
-    </p>
+    <!-- Header -->
+    <header class="staff-header">
+      <div>
+        <h1>Staff Portal</h1>
+        <p class="subtitle">Room Companion Alert Dashboard</p>
+      </div>
+    </header>
 
-    <p class="note">Help alerts (last 30 min):
-      101 – {{ room_help_counts['101'] }}{% if room_help_counts['101'] >= 3 %}!{% endif %} |
-      102 – {{ room_help_counts['102'] }}{% if room_help_counts['102'] >= 3 %}!{% endif %} |
-      103 – {{ room_help_counts['103'] }}{% if room_help_counts['103'] >= 3 %}!{% endif %}
-    </p>
+    <!-- Room Status Cards -->
+    <section class="room-cards">
+      {% for rid, profile in profiles.items() %}
+      <div class="room-card {% if room_latest_severity[rid] %}severity-{{ room_latest_severity[rid] }}{% endif %}">
+        <div class="room-card-header">
+          <div>
+            <span class="room-card-name">{{ profile.resident_name }}</span>
+            <span class="room-card-room">{{ rid }}</span>
+          </div>
+          <span class="mode-badge {% if profile.mode == 'memory_support' %}memory-support{% else %}standard{% endif %}">
+            {% if profile.mode == 'memory_support' %}Memory{% else %}Standard{% endif %}
+          </span>
+        </div>
+        <div class="room-card-stats">
+          <div class="room-stat">
+            <div class="room-stat-value">{{ room_help_counts[rid] }}</div>
+            <div class="room-stat-label">Help (30m)</div>
+          </div>
+          <div class="room-stat">
+            <div class="room-stat-value">{{ room_orientation_counts[rid] }}</div>
+            <div class="room-stat-label">Orient. (7d)</div>
+          </div>
+          <div class="room-stat">
+            <div class="room-stat-value">{{ room_active_alerts[rid] }}</div>
+            <div class="room-stat-label">Active</div>
+          </div>
+          <div class="room-stat">
+            <a href="/room/{{ rid }}" style="text-decoration:none;color:var(--blue);font-size:0.75rem;">View Room</a>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </section>
 
-    <p class="note">Orientation questions (last 7 days):
-      101 – {{ room_orientation_counts['101'] }}{% if room_orientation_counts['101'] >= 10 %}!{% endif %} |
-      102 – {{ room_orientation_counts['102'] }}{% if room_orientation_counts['102'] >= 10 %}!{% endif %} |
-      103 – {{ room_orientation_counts['103'] }}{% if room_orientation_counts['103'] >= 10 %}!{% endif %}
-    </p>
-
-    <p class="note">(Rough count of "where am I / what time / what day" style questions – a simple confusion signal, not a diagnosis. "!" means unusually high.)</p>
-
-    <p class="note">Source icons: ● button call, 🎤 voice/question, ? other, - not a help alert.</p>
-
-    {% if alerts %}
-      <table class="alerts-table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Time (UTC)</th>
-            <th>Room</th>
-            <th>Resident</th>
-            <th>Mode</th>
-            <th>Type</th>
-            <th>Source</th>
-            <th>Status</th>
-            <th>Message</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-        {% for alert in alerts %}
-          <tr class="status-{{ alert.status }}">
-            <td>{{ alert.id }}</td>
-            <td>{{ alert.created_at }}</td>
-            <td>{{ alert.room_id }}</td>
-            <td>{{ alert.resident_name }}</td>
-            <td>{% if alert.mode == 'memory_support' %}Memory Support{% else %}Standard{% endif %}</td>
-            <td>{{ alert.type }}</td>
-            <td>
-              {% if alert.type == 'help' %}
-                {% if alert.message.startswith('Resident requested help via button') %}
-                  ●
-                {% elif alert.message.startswith('Possible distress from question input') %}
-                  🎤
-                {% else %}
-                  ?
-                {% endif %}
-              {% else %}
-                -
-              {% endif %}
-            </td>
-            <td>{{ alert.status }}</td>
-            <td>{{ alert.message }}</td>
-            <td>
-              <form method="post" action="/staff/alerts/{{ alert.id }}/ack" style="display:inline;">
-                <button type="submit" class="btn btn-small" {% if alert.status != 'new' %}disabled{% endif %}>Ack</button>
-              </form>
-              <form method="post" action="/staff/alerts/{{ alert.id }}/resolve" style="display:inline;">
-                <button type="submit" class="btn btn-small" {% if alert.status == 'resolved' %}disabled{% endif %}>Resolve</button>
-              </form>
-            </td>
-          </tr>
+    <!-- Filter Bar -->
+    <form class="filter-bar" method="get" action="/staff">
+      <label>Filters:</label>
+      <select name="room_id" onchange="this.form.submit()">
+        <option value="">All Rooms</option>
+        {% for rid, profile in profiles.items() %}
+        <option value="{{ rid }}" {% if filter_room == rid %}selected{% endif %}>{{ rid }} — {{ profile.resident_name }}</option>
         {% endfor %}
-        </tbody>
-      </table>
-    {% else %}
-      <p>No alerts yet.</p>
-    {% endif %}
+      </select>
+      <select name="severity" onchange="this.form.submit()">
+        <option value="">All Severities</option>
+        <option value="emergency" {% if filter_severity == 'emergency' %}selected{% endif %}>Emergency</option>
+        <option value="urgent" {% if filter_severity == 'urgent' %}selected{% endif %}>Urgent</option>
+        <option value="routine" {% if filter_severity == 'routine' %}selected{% endif %}>Routine</option>
+        <option value="informational" {% if filter_severity == 'informational' %}selected{% endif %}>Informational</option>
+      </select>
+      <select name="status" onchange="this.form.submit()">
+        <option value="">All Statuses</option>
+        <option value="new" {% if filter_status == 'new' %}selected{% endif %}>New</option>
+        <option value="ack" {% if filter_status == 'ack' %}selected{% endif %}>Acknowledged</option>
+        <option value="resolved" {% if filter_status == 'resolved' %}selected{% endif %}>Resolved</option>
+      </select>
+      {% if filter_room or filter_severity or filter_status %}
+      <a href="/staff" class="filter-reset">Clear filters</a>
+      {% endif %}
+    </form>
 
-    <p class="link"><a href="/room">Back to room view</a></p>
+    <!-- Alert Feed -->
+    <section class="alert-feed">
+      {% if alerts %}
+        {% for alert in alerts %}
+        <div class="alert-card status-{{ alert.status }}">
+          <!-- Severity pill -->
+          <div>
+            <span class="severity-pill {{ alert.severity }}">
+              <span class="severity-dot"></span>
+              {{ alert.severity }}
+            </span>
+          </div>
+
+          <!-- Content -->
+          <div class="alert-content">
+            <div class="alert-meta">
+              <span class="alert-room">{{ alert.resident_name }} — Room {{ alert.room_id }}</span>
+              <span class="alert-timestamp">{{ alert.created_at[:19] }}</span>
+              <span class="alert-status {{ alert.status }}">{{ alert.status }}</span>
+              {% if alert.mode == 'memory_support' %}
+              <span class="mode-badge memory-support">Memory</span>
+              {% endif %}
+            </div>
+            <div class="alert-message">{{ alert.message }}</div>
+          </div>
+
+          <!-- Actions -->
+          <div class="alert-actions">
+            <form method="post" action="/staff/alerts/{{ alert.id }}/ack" style="display:inline;">
+              <button type="submit" class="btn-action ack-btn" {% if alert.status != 'new' %}disabled{% endif %}>Acknowledge</button>
+            </form>
+            <form method="post" action="/staff/alerts/{{ alert.id }}/resolve" style="display:inline;">
+              <button type="submit" class="btn-action resolve-btn" {% if alert.status == 'resolved' %}disabled{% endif %}>Resolve</button>
+            </form>
+          </div>
+        </div>
+        {% endfor %}
+      {% else %}
+        <div class="empty-state">
+          <div class="empty-state-icon">&#x2705;</div>
+          <p>No alerts to show. All is well.</p>
+        </div>
+      {% endif %}
+    </section>
+
+    <!-- Navigation -->
+    <nav class="staff-nav">
+      <a href="/room/101">Room 101 (Margaret)</a>
+      <a href="/room/102">Room 102 (Harold)</a>
+      <a href="/room/103">Room 103 (Dorothy)</a>
+    </nav>
+
   </div>
 </body>
 </html>
