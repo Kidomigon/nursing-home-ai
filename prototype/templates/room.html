@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Resident Room – Prototype</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script defer src="/static/voice.js"></script>
+</head>
+<body class="room">
+  <div class="container">
+    <h1>Room {{ room_id }}</h1>
+    <h2>{{ resident_name }}</h2>
+    <p class="note">Mode: {% if mode == 'memory_support' %}Memory Support{% else %}Standard{% endif %}</p>
+    <div id="voice-banner" class="voice-banner" style="display:none;">
+      <span id="voice-banner-text">Listening...</span>
+    </div>
+
+    {% if mode == 'memory_support' %}
+    <div class="card">
+      <p><strong>You are in your room at your care home.</strong></p>
+      <p class="note">It is {{ current_day }}. This helper can remind you where you are, what time it is, and when meals and activities happen.</p>
+    </div>
+    {% endif %}
+
+    <div class="card">
+      <h3>Need Help?</h3>
+      <form method="post" action="/room/{{ room_id }}/help">
+        <input type="hidden" name="resident_name" value="{{ resident_name }}" />
+        <button type="submit" class="btn btn-danger btn-large">Call for Help</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Ask a Question</h3>
+      {% if mode == 'memory_support' %}
+      <p class="note">You can ask things like "Where am I?", "What time is it?", or "When is my next meal?"</p>
+      <p class="note"><label><input type="checkbox" id="auto-send-voice" /> Send automatically when I stop speaking</label></p>
+      {% endif %}
+      <form method="post" action="/room/{{ room_id }}/question">
+        <input type="hidden" name="resident_name" value="{{ resident_name }}" />
+        <textarea id="question-input" name="question" rows="3" placeholder="You can type or use the microphone to ask a question."></textarea>
+        <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; align-items: center;">
+          <button type="submit" class="btn">Send</button>
+          <button id="voice-btn" class="btn" type="button">🎤 Speak</button>
+          <span id="voice-support-note" class="note"></span>
+        </div>
+      </form>
+      {% if last_answer %}
+      <p class="note"><strong>Last answer:</strong> {{ last_answer }}</p>
+      {% endif %}
+      <p class="note">(Some questions may create a help alert if they sound like distress.)</p>
+    </div>
+
+    <p class="link"><a href="/staff">Go to staff view</a></p>
+  </div>
+</body>
+</html>
