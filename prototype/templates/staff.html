@@ -10,11 +10,15 @@
 <body>
   <div class="staff-layout">
 
-    <!-- Header -->
+    <!-- Header with staff identity -->
     <header class="staff-header">
       <div>
         <h1>Staff Portal</h1>
         <p class="subtitle">Room Companion Alert Dashboard</p>
+      </div>
+      <div class="staff-identity">
+        <span class="staff-name-badge">&#x1F464; {{ staff_name }}</span>
+        <a href="/staff/logout" class="logout-link">Sign out</a>
       </div>
     </header>
 
@@ -44,8 +48,9 @@
             <div class="room-stat-value">{{ room_active_alerts[rid] }}</div>
             <div class="room-stat-label">Active</div>
           </div>
-          <div class="room-stat">
-            <a href="/room/{{ rid }}" style="text-decoration:none;color:var(--blue);font-size:0.75rem;">View Room</a>
+          <div class="room-stat room-stat-actions">
+            <a href="/room/{{ rid }}" class="room-link">View</a>
+            <button type="button" class="room-edit-btn" onclick="openEditModal('{{ rid }}', '{{ profile.resident_name }}', '{{ profile.mode }}')">Edit</button>
           </div>
         </div>
       </div>
@@ -103,16 +108,35 @@
               {% endif %}
             </div>
             <div class="alert-message">{{ alert.message }}</div>
+
+            <!-- Attribution & notes -->
+            {% if alert.acknowledged_by %}
+            <div class="alert-attribution">
+              &#x2705; Ack'd by <strong>{{ alert.acknowledged_by }}</strong>
+              {% if alert.acknowledged_at %}<span class="attr-time">{{ alert.acknowledged_at[:19] }}</span>{% endif %}
+            </div>
+            {% endif %}
+            {% if alert.resolved_by %}
+            <div class="alert-attribution resolved">
+              &#x2714;&#xFE0F; Resolved by <strong>{{ alert.resolved_by }}</strong>
+              {% if alert.resolved_at %}<span class="attr-time">{{ alert.resolved_at[:19] }}</span>{% endif %}
+            </div>
+            {% endif %}
+            {% if alert.notes %}
+            <div class="alert-notes">
+              <span class="notes-label">Notes:</span> {{ alert.notes }}
+            </div>
+            {% endif %}
           </div>
 
-          <!-- Actions -->
+          <!-- Actions with notes -->
           <div class="alert-actions">
-            <form method="post" action="/staff/alerts/{{ alert.id }}/ack" style="display:inline;">
-              <button type="submit" class="btn-action ack-btn" {% if alert.status != 'new' %}disabled{% endif %}>Acknowledge</button>
-            </form>
-            <form method="post" action="/staff/alerts/{{ alert.id }}/resolve" style="display:inline;">
-              <button type="submit" class="btn-action resolve-btn" {% if alert.status == 'resolved' %}disabled{% endif %}>Resolve</button>
-            </form>
+            {% if alert.status == 'new' %}
+            <button type="button" class="btn-action ack-btn" onclick="openNotesModal({{ alert.id }}, 'ack')">Acknowledge</button>
+            {% endif %}
+            {% if alert.status != 'resolved' %}
+            <button type="button" class="btn-action resolve-btn" onclick="openNotesModal({{ alert.id }}, 'resolve')">Resolve</button>
+            {% endif %}
           </div>
         </div>
         {% endfor %}
@@ -126,11 +150,103 @@
 
     <!-- Navigation -->
     <nav class="staff-nav">
-      <a href="/room/101">Room 101 (Margaret)</a>
-      <a href="/room/102">Room 102 (Harold)</a>
-      <a href="/room/103">Room 103 (Dorothy)</a>
+      {% for rid, profile in profiles.items() %}
+      <a href="/room/{{ rid }}">Room {{ rid }} ({{ profile.resident_name }})</a>
+      {% endfor %}
     </nav>
 
   </div>
+
+  <!-- Notes Modal (for ack/resolve) -->
+  <div id="notes-modal" class="modal-overlay" style="display:none;">
+    <div class="modal-card">
+      <h3 id="notes-modal-title">Add Notes</h3>
+      <form id="notes-form" method="post">
+        <textarea name="notes" id="notes-textarea" rows="3" placeholder="Optional notes about this alert..."></textarea>
+        <div class="modal-actions">
+          <button type="button" class="btn-action" onclick="closeNotesModal()">Cancel</button>
+          <button type="submit" class="btn-action resolve-btn" id="notes-submit-btn">Confirm</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Edit Room Modal -->
+  <div id="edit-modal" class="modal-overlay" style="display:none;">
+    <div class="modal-card">
+      <h3>Edit Room</h3>
+      <form id="edit-form" method="post">
+        <label for="edit-name">Resident Name</label>
+        <input type="text" id="edit-name" name="resident_name" required />
+
+        <label for="edit-mode">Care Mode</label>
+        <select id="edit-mode" name="mode">
+          <option value="standard">Standard</option>
+          <option value="memory_support">Memory Support</option>
+        </select>
+
+        <div class="modal-actions">
+          <button type="button" class="btn-action" onclick="closeEditModal()">Cancel</button>
+          <button type="submit" class="btn-action ack-btn">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    // Notes modal
+    function openNotesModal(alertId, action) {
+      const modal = document.getElementById('notes-modal');
+      const form = document.getElementById('notes-form');
+      const title = document.getElementById('notes-modal-title');
+      const btn = document.getElementById('notes-submit-btn');
+      const textarea = document.getElementById('notes-textarea');
+
+      form.action = '/staff/alerts/' + alertId + '/' + action;
+      title.textContent = action === 'ack' ? 'Acknowledge Alert' : 'Resolve Alert';
+      btn.textContent = action === 'ack' ? 'Acknowledge' : 'Resolve';
+      btn.className = 'btn-action ' + (action === 'ack' ? 'ack-btn' : 'resolve-btn');
+      textarea.value = '';
+      modal.style.display = 'flex';
+      textarea.focus();
+    }
+
+    function closeNotesModal() {
+      document.getElementById('notes-modal').style.display = 'none';
+    }
+
+    // Edit room modal
+    function openEditModal(roomId, name, mode) {
+      const modal = document.getElementById('edit-modal');
+      const form = document.getElementById('edit-form');
+      form.action = '/staff/rooms/' + roomId + '/edit';
+      document.getElementById('edit-name').value = name;
+      document.getElementById('edit-mode').value = mode;
+      modal.style.display = 'flex';
+      document.getElementById('edit-name').focus();
+    }
+
+    function closeEditModal() {
+      document.getElementById('edit-modal').style.display = 'none';
+    }
+
+    // Close modals on overlay click
+    document.querySelectorAll('.modal-overlay').forEach(function(overlay) {
+      overlay.addEventListener('click', function(e) {
+        if (e.target === overlay) {
+          overlay.style.display = 'none';
+        }
+      });
+    });
+
+    // Close modals on Escape
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') {
+        document.querySelectorAll('.modal-overlay').forEach(function(m) {
+          m.style.display = 'none';
+        });
+      }
+    });
+  </script>
 </body>
 </html>

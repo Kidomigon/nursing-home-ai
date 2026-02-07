@@ -4,17 +4,21 @@ Features:
 - LLM-powered conversational chat per room
 - Intent classification with severity levels
 - Real-time alert management for staff
-- Multi-room support with resident profiles
+- DB-driven multi-room support with resident profiles
+- Staff authentication (shared PIN + name)
+- Alert notes and attribution
 - Voice input/output (handled client-side)
 """
 
 import asyncio
+import hashlib
+import secrets
 from datetime import datetime
 import datetime as dt
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -31,6 +35,10 @@ app = FastAPI(title="Room Companion")
 # Static files & templates
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+# Staff PIN — SHA-256 hash of "1234" (change for production)
+STAFF_PIN_HASH = hashlib.sha256("1234".encode()).hexdigest()
+SESSION_EXPIRY_HOURS = 8
 
 
 # ==========================
@@ -70,17 +78,57 @@ def init_db():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rooms (
+            room_id TEXT PRIMARY KEY,
+            resident_name TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'standard'
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            staff_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+        """
+    )
+
     # Migration: add severity column if missing (existing DBs)
     cursor.execute("PRAGMA table_info(alerts)")
     columns = [row[1] for row in cursor.fetchall()]
     if "severity" not in columns:
         cursor.execute("ALTER TABLE alerts ADD COLUMN severity TEXT NOT NULL DEFAULT 'routine'")
+    if "acknowledged_by" not in columns:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN acknowledged_by TEXT")
+    if "resolved_by" not in columns:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN resolved_by TEXT")
+    if "notes" not in columns:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN notes TEXT")
 
     # Migration: add response column to questions if missing
     cursor.execute("PRAGMA table_info(questions)")
     columns = [row[1] for row in cursor.fetchall()]
     if "response" not in columns:
         cursor.execute("ALTER TABLE questions ADD COLUMN response TEXT")
+
+    # Auto-seed rooms from defaults if table is empty
+    cursor.execute("SELECT COUNT(*) FROM rooms")
+    if cursor.fetchone()[0] == 0:
+        defaults = [
+            ("101", "Margaret", "standard"),
+            ("102", "Harold", "memory_support"),
+            ("103", "Dorothy", "standard"),
+        ]
+        cursor.executemany(
+            "INSERT INTO rooms (room_id, resident_name, mode) VALUES (?, ?, ?)",
+            defaults,
+        )
 
     conn.commit()
     conn.close()
@@ -90,6 +138,77 @@ def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def get_rooms() -> dict:
+    """Load all room profiles from the database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT room_id, resident_name, mode FROM rooms ORDER BY room_id")
+    rooms = {}
+    for row in cursor.fetchall():
+        rooms[row["room_id"]] = {
+            "resident_name": row["resident_name"],
+            "mode": row["mode"],
+        }
+    conn.close()
+    return rooms
+
+
+# ==========================
+# Auth helpers
+# ==========================
+
+def create_session(staff_name: str) -> str:
+    """Create a new session token for a staff member."""
+    token = secrets.token_urlsafe(32)
+    now = datetime.utcnow()
+    expires = now + dt.timedelta(hours=SESSION_EXPIRY_HOURS)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO sessions (token, staff_name, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (token, staff_name, now.isoformat(), expires.isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+def get_session(token: Optional[str]) -> Optional[str]:
+    """Validate a session token and return the staff name, or None if invalid/expired."""
+    if not token:
+        return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT staff_name, expires_at FROM sessions WHERE token = ?", (token,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    if datetime.fromisoformat(row["expires_at"]) < datetime.utcnow():
+        # Expired — clean up
+        conn = get_db_connection()
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        return None
+    return row["staff_name"]
+
+
+def delete_session(token: str):
+    """Delete a session token."""
+    conn = get_db_connection()
+    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+
+
+def verify_pin(pin: str) -> bool:
+    """Check if the provided PIN matches the stored hash."""
+    return hashlib.sha256(pin.encode()).hexdigest() == STAFF_PIN_HASH
 
 
 # Run at startup
@@ -119,8 +238,11 @@ class Alert(BaseModel):
     status: str
     severity: str
     created_at: str
-    acknowledged_at: Optional[str]
-    resolved_at: Optional[str]
+    acknowledged_at: Optional[str] = None
+    resolved_at: Optional[str] = None
+    acknowledged_by: Optional[str] = None
+    resolved_by: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -136,26 +258,6 @@ class ChatResponse(BaseModel):
 class TTSRequest(BaseModel):
     text: str
     mode: str = "standard"
-
-
-# ==========================
-# Resident profiles
-# ==========================
-
-RESIDENT_PROFILES = {
-    "101": {
-        "resident_name": "Margaret",
-        "mode": "standard",
-    },
-    "102": {
-        "resident_name": "Harold",
-        "mode": "memory_support",
-    },
-    "103": {
-        "resident_name": "Dorothy",
-        "mode": "standard",
-    },
-}
 
 
 # ==========================
@@ -207,15 +309,16 @@ def list_alerts(status: Optional[str] = None, room_id: Optional[str] = None):
 
 
 @app.post("/api/alerts/{alert_id}/ack", response_model=Alert)
-def acknowledge_alert(alert_id: int):
+def acknowledge_alert(alert_id: int, staff_name: Optional[str] = None, notes: Optional[str] = None):
     """Mark an alert as acknowledged."""
     now_str = datetime.utcnow().isoformat()
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        """UPDATE alerts SET status = 'ack', acknowledged_at = ?
+        """UPDATE alerts SET status = 'ack', acknowledged_at = ?,
+           acknowledged_by = ?, notes = COALESCE(?, notes)
            WHERE id = ? AND status = 'new'""",
-        (now_str, alert_id),
+        (now_str, staff_name, notes, alert_id),
     )
     conn.commit()
     cursor.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,))
@@ -225,15 +328,22 @@ def acknowledge_alert(alert_id: int):
 
 
 @app.post("/api/alerts/{alert_id}/resolve", response_model=Alert)
-def resolve_alert(alert_id: int):
+def resolve_alert(alert_id: int, staff_name: Optional[str] = None, notes: Optional[str] = None):
     """Mark an alert as resolved."""
     now_str = datetime.utcnow().isoformat()
     conn = get_db_connection()
     cursor = conn.cursor()
+    # Append new notes to existing if both present
+    if notes:
+        cursor.execute("SELECT notes FROM alerts WHERE id = ?", (alert_id,))
+        existing = cursor.fetchone()
+        if existing and existing["notes"]:
+            notes = existing["notes"] + "\n" + notes
     cursor.execute(
-        """UPDATE alerts SET status = 'resolved', resolved_at = ?
+        """UPDATE alerts SET status = 'resolved', resolved_at = ?,
+           resolved_by = ?, notes = COALESCE(?, notes)
            WHERE id = ?""",
-        (now_str, alert_id),
+        (now_str, staff_name, notes, alert_id),
     )
     conn.commit()
     cursor.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,))
@@ -247,10 +357,10 @@ def alerts_summary():
     """Per-room summary: help counts (30m), orientation counts (7d), active alerts."""
     conn = get_db_connection()
     cursor = conn.cursor()
+    rooms = get_rooms()
     summary = {}
 
-    for room_id, profile in RESIDENT_PROFILES.items():
-        # Help alert count (last 30 min)
+    for room_id, profile in rooms.items():
         cursor.execute(
             """SELECT COUNT(*) FROM alerts
                WHERE room_id = ? AND type = 'help'
@@ -259,7 +369,6 @@ def alerts_summary():
         )
         help_count = cursor.fetchone()[0]
 
-        # Orientation question count (last 7 days)
         cursor.execute(
             """SELECT COUNT(*) FROM questions
                WHERE room_id = ?
@@ -271,7 +380,6 @@ def alerts_summary():
         )
         orientation_count = cursor.fetchone()[0]
 
-        # Active (unresolved) alerts count
         cursor.execute(
             """SELECT COUNT(*) FROM alerts
                WHERE room_id = ? AND status != 'resolved'""",
@@ -279,7 +387,6 @@ def alerts_summary():
         )
         active_count = cursor.fetchone()[0]
 
-        # Most recent alert severity
         cursor.execute(
             """SELECT severity FROM alerts
                WHERE room_id = ? AND status != 'resolved'
@@ -302,6 +409,16 @@ def alerts_summary():
     return summary
 
 
+@app.get("/api/rooms/{room_id}")
+def get_room(room_id: str):
+    """Get a single room profile."""
+    rooms = get_rooms()
+    profile = rooms.get(room_id)
+    if not profile:
+        return JSONResponse({"error": "Unknown room"}, status_code=404)
+    return {"room_id": room_id, **profile}
+
+
 # ==========================
 # Chat endpoint (LLM-powered)
 # ==========================
@@ -313,7 +430,8 @@ async def room_chat(room_id: str, req: ChatRequest):
     Runs LLM chat and classification in parallel.
     Creates alert if classification detects a help request.
     """
-    profile = RESIDENT_PROFILES.get(room_id)
+    rooms = get_rooms()
+    profile = rooms.get(room_id)
     if not profile:
         return JSONResponse({"error": "Unknown room"}, status_code=404)
 
@@ -384,13 +502,63 @@ async def text_to_speech(req: TTSRequest):
 
 
 # ==========================
+# Staff auth views
+# ==========================
+
+@app.get("/staff/login", response_class=HTMLResponse)
+async def staff_login_page(request: Request, error: Optional[str] = None):
+    """Staff login page."""
+    return templates.TemplateResponse(
+        "staff_login.html", {"request": request, "error": error or ""}
+    )
+
+
+@app.post("/staff/login")
+async def staff_login(
+    request: Request,
+    staff_name: str = Form(...),
+    pin: str = Form(...),
+):
+    """Handle staff login — validate PIN and create session."""
+    staff_name = staff_name.strip()
+    if not staff_name or not verify_pin(pin):
+        return templates.TemplateResponse(
+            "staff_login.html",
+            {"request": request, "error": "Invalid name or PIN."},
+            status_code=401,
+        )
+
+    token = create_session(staff_name)
+    response = RedirectResponse(url="/staff", status_code=303)
+    response.set_cookie(
+        key="session_token",
+        value=token,
+        httponly=True,
+        max_age=SESSION_EXPIRY_HOURS * 3600,
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/staff/logout")
+async def staff_logout(session_token: Optional[str] = Cookie(None)):
+    """Log out staff — delete session and redirect to login."""
+    if session_token:
+        delete_session(session_token)
+    response = RedirectResponse(url="/staff/login", status_code=303)
+    response.delete_cookie("session_token")
+    return response
+
+
+# ==========================
 # HTML views
 # ==========================
 
 @app.get("/room/{room_id}", response_class=HTMLResponse)
 async def room_view(request: Request, room_id: str):
     """Room UI — resident-facing chat interface."""
-    profile = RESIDENT_PROFILES.get(room_id)
+    rooms = get_rooms()
+    profile = rooms.get(room_id)
     if not profile:
         return HTMLResponse(content=f"Unknown room: {room_id}", status_code=404)
 
@@ -431,8 +599,19 @@ async def room_call_help(room_id: str, resident_name: str = Form(...)):
 
 
 @app.get("/staff", response_class=HTMLResponse)
-async def staff_view(request: Request, room_id: Optional[str] = None, severity: Optional[str] = None, status: Optional[str] = None):
-    """Staff portal — alert dashboard with room status cards."""
+async def staff_view(
+    request: Request,
+    room_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    status: Optional[str] = None,
+    session_token: Optional[str] = Cookie(None),
+):
+    """Staff portal — alert dashboard with room status cards. Requires auth."""
+    staff_name = get_session(session_token)
+    if not staff_name:
+        return RedirectResponse(url="/staff/login", status_code=303)
+
+    rooms = get_rooms()
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -464,7 +643,7 @@ async def staff_view(request: Request, room_id: Optional[str] = None, severity: 
     room_active_alerts = {}
     room_latest_severity = {}
 
-    for rid in RESIDENT_PROFILES.keys():
+    for rid in rooms.keys():
         cursor.execute(
             """SELECT COUNT(*) FROM alerts
                WHERE room_id = ? AND type = 'help'
@@ -502,14 +681,14 @@ async def staff_view(request: Request, room_id: Optional[str] = None, severity: 
 
     alerts = [dict(row) for row in rows]
     for alert in alerts:
-        profile = RESIDENT_PROFILES.get(alert["room_id"], {})
+        profile = rooms.get(alert["room_id"], {})
         alert["mode"] = profile.get("mode", "standard")
 
     return templates.TemplateResponse(
         "staff.html", {
             "request": request,
             "alerts": alerts,
-            "profiles": RESIDENT_PROFILES,
+            "profiles": rooms,
             "room_help_counts": room_help_counts,
             "room_orientation_counts": room_orientation_counts,
             "room_active_alerts": room_active_alerts,
@@ -517,19 +696,59 @@ async def staff_view(request: Request, room_id: Optional[str] = None, severity: 
             "filter_room": room_id or "",
             "filter_severity": severity or "",
             "filter_status": status or "",
+            "staff_name": staff_name,
         }
     )
 
 
 @app.post("/staff/alerts/{alert_id}/ack")
-async def staff_ack_alert(alert_id: int):
-    acknowledge_alert(alert_id)
+async def staff_ack_alert(
+    alert_id: int,
+    notes: str = Form(""),
+    session_token: Optional[str] = Cookie(None),
+):
+    """Acknowledge an alert with optional notes."""
+    staff_name = get_session(session_token)
+    if not staff_name:
+        return RedirectResponse(url="/staff/login", status_code=303)
+    acknowledge_alert(alert_id, staff_name=staff_name, notes=notes.strip() or None)
     return RedirectResponse(url="/staff", status_code=303)
 
 
 @app.post("/staff/alerts/{alert_id}/resolve")
-async def staff_resolve_alert(alert_id: int):
-    resolve_alert(alert_id)
+async def staff_resolve_alert(
+    alert_id: int,
+    notes: str = Form(""),
+    session_token: Optional[str] = Cookie(None),
+):
+    """Resolve an alert with optional notes."""
+    staff_name = get_session(session_token)
+    if not staff_name:
+        return RedirectResponse(url="/staff/login", status_code=303)
+    resolve_alert(alert_id, staff_name=staff_name, notes=notes.strip() or None)
+    return RedirectResponse(url="/staff", status_code=303)
+
+
+@app.post("/staff/rooms/{room_id}/edit")
+async def staff_edit_room(
+    room_id: str,
+    resident_name: str = Form(...),
+    mode: str = Form(...),
+    session_token: Optional[str] = Cookie(None),
+):
+    """Edit a room's resident name or care mode."""
+    staff_name = get_session(session_token)
+    if not staff_name:
+        return RedirectResponse(url="/staff/login", status_code=303)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE rooms SET resident_name = ?, mode = ? WHERE room_id = ?",
+        (resident_name.strip(), mode, room_id),
+    )
+    conn.commit()
+    conn.close()
     return RedirectResponse(url="/staff", status_code=303)
 
 
