@@ -1,9 +1,9 @@
 /**
  * Room Companion — Voice Input (STT) & Output (TTS)
  *
- * - Text-to-Speech via Web Speech Synthesis API
- * - Speech-to-Text via Web Speech Recognition API
- * - Mode-aware speech rate (slower for memory support)
+ * - TTS via server-side edge-tts (POST /api/tts → MP3 → <audio>)
+ * - STT via Web Speech Recognition API
+ * - Mode-aware speech rate (server adjusts for memory support)
  * - Mute toggle, pulsing mic indicator
  */
 
@@ -13,41 +13,92 @@
   const config = window.ROOM_CONFIG;
   if (!config) return;
 
-  // ---- TTS ----
+  // ---- TTS (server-side) ----
 
-  const synth = window.speechSynthesis;
-  let ttsVoice = null;
   let muted = false;
-  const speechRate = config.mode === 'memory_support' ? 0.85 : 1.0;
+  let currentAudio = null;
+  let audioQueue = [];
+  let isPlaying = false;
+  let userHasInteracted = false;
 
-  // Pick a calm English voice when voices load
-  function selectVoice() {
-    const voices = synth.getVoices();
-    // Prefer a female English voice for warmth
-    const preferred = ['Samantha', 'Karen', 'Victoria', 'Google UK English Female', 'Microsoft Zira'];
-    for (const name of preferred) {
-      const v = voices.find(v => v.name.includes(name));
-      if (v) { ttsVoice = v; return; }
+  // Chrome blocks autoplay until user interacts with the page.
+  // Track first interaction, then play any queued greeting audio.
+  function onFirstInteraction() {
+    if (userHasInteracted) return;
+    userHasInteracted = true;
+    document.removeEventListener('click', onFirstInteraction);
+    document.removeEventListener('keydown', onFirstInteraction);
+    // If greeting was queued before interaction, play it now
+    if (audioQueue.length > 0 && !isPlaying) {
+      playNext();
     }
-    // Fallback: first English voice
-    ttsVoice = voices.find(v => v.lang.startsWith('en')) || voices[0] || null;
+  }
+  document.addEventListener('click', onFirstInteraction);
+  document.addEventListener('keydown', onFirstInteraction);
+
+  async function speak(text) {
+    if (!text || muted) return;
+
+    // Queue it
+    audioQueue.push(text);
+    // Only auto-play if user has interacted (Chrome autoplay policy)
+    if (!isPlaying && userHasInteracted) {
+      playNext();
+    }
   }
 
-  if (synth) {
-    synth.onvoiceschanged = selectVoice;
-    selectVoice();
-  }
+  async function playNext() {
+    if (audioQueue.length === 0) {
+      isPlaying = false;
+      return;
+    }
 
-  function speak(text) {
-    if (!synth || muted || !text) return;
-    // Cancel any ongoing speech
-    synth.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = speechRate;
-    utterance.pitch = 1.0;
-    utterance.volume = 0.9;
-    if (ttsVoice) utterance.voice = ttsVoice;
-    synth.speak(utterance);
+    isPlaying = true;
+    const text = audioQueue.shift();
+
+    try {
+      const resp = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text, mode: config.mode }),
+      });
+
+      if (!resp.ok) throw new Error(`TTS HTTP ${resp.status}`);
+
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      currentAudio = new Audio(url);
+
+      currentAudio.onended = () => {
+        URL.revokeObjectURL(url);
+        currentAudio = null;
+        playNext();
+      };
+
+      currentAudio.onerror = (e) => {
+        console.error('[Voice] Audio playback error:', e);
+        URL.revokeObjectURL(url);
+        currentAudio = null;
+        playNext();
+      };
+
+      if (!muted) {
+        try {
+          await currentAudio.play();
+        } catch (playErr) {
+          console.warn('[Voice] Autoplay blocked, will retry after interaction:', playErr.message);
+          // Re-queue the text for later
+          audioQueue.unshift(text);
+          isPlaying = false;
+        }
+      } else {
+        playNext();
+      }
+    } catch (err) {
+      console.error('[Voice] TTS fetch error:', err);
+      isPlaying = false;
+      playNext();
+    }
   }
 
   // Mute toggle
@@ -58,11 +109,17 @@
       muteBtn.classList.toggle('muted', muted);
       muteBtn.setAttribute('aria-label', muted ? 'Unmute voice' : 'Mute voice');
       muteBtn.querySelector('.mute-icon').textContent = muted ? '\u{1F507}' : '\u{1F50A}';
-      if (muted && synth) synth.cancel();
+      // Stop current playback if muting
+      if (muted && currentAudio) {
+        currentAudio.pause();
+        currentAudio = null;
+        audioQueue = [];
+        isPlaying = false;
+      }
     });
   }
 
-  // ---- STT ----
+  // ---- STT (browser-side, unchanged) ----
 
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   const micBtn = document.getElementById('mic-btn');

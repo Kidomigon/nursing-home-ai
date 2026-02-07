@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -131,6 +131,11 @@ class ChatResponse(BaseModel):
     response: str
     alert_created: bool
     severity: Optional[str] = None
+
+
+class TTSRequest(BaseModel):
+    text: str
+    mode: str = "standard"
 
 
 # ==========================
@@ -351,6 +356,31 @@ async def room_chat(room_id: str, req: ChatRequest):
     conn.close()
 
     return ChatResponse(response=response_text, alert_created=alert_created, severity=severity)
+
+
+# ==========================
+# TTS endpoint (server-side via edge-tts)
+# ==========================
+
+@app.post("/api/tts")
+async def text_to_speech(req: TTSRequest):
+    """Generate speech audio from text using Microsoft Edge TTS."""
+    import edge_tts
+
+    text = req.text.strip()
+    if not text:
+        return JSONResponse({"error": "No text"}, status_code=400)
+
+    voice = "en-US-AriaNeural"
+    rate = "-10%" if req.mode == "memory_support" else "+0%"
+
+    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
+    chunks = []
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            chunks.append(chunk["data"])
+
+    return Response(content=b"".join(chunks), media_type="audio/mpeg")
 
 
 # ==========================
