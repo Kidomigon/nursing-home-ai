@@ -18,16 +18,16 @@
       {% endif %}
 
       <form method="post" action="/staff/login" class="login-form">
-        <label for="staff_name">Your Name</label>
-        <input type="text" id="staff_name" name="staff_name" placeholder="e.g. Nurse Sarah" required autocomplete="name" autofocus />
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" placeholder="e.g. sarah.jones" required autocomplete="username" autofocus />
 
-        <label for="pin">Staff PIN</label>
-        <input type="password" id="pin" name="pin" placeholder="4-digit PIN" required maxlength="10" inputmode="numeric" pattern="[0-9]*" />
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" placeholder="Enter your password" required autocomplete="current-password" />
 
         <button type="submit" class="login-btn">Sign In</button>
       </form>
 
-      <p class="login-footer">Contact your supervisor if you don't have a PIN.</p>
+      <p class="login-footer">Contact your administrator if you don't have an account.</p>
     </div>
   </div>
 </body>

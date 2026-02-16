@@ -1,130 +1,215 @@
-# Build Roadmap – Nursing Home AI Prototype
+# Build Roadmap — Nursing Home AI (Room Companion)
 
-Goal: Build a working **end-to-end prototype** you can demo, then grow toward a pilot.
-Stack (for now):
-- Backend & API: **Python + FastAPI** (or Flask if needed, but FastAPI is better for async + docs).
-- Storage: **SQLite**.
-- Frontend: simple **HTML/JS web pages** served by the backend, so they run on desktop or tablet.
+Goal: Build a working **end-to-end prototype** you can demo, then grow toward a pilot deployment in a real facility.
 
----
-
-## Phase 1 – Single-Room Prototype (Happy Path)
-
-**Objective:**
-Show the full loop for a *single room* on your network:
-Resident talks → device detects a help phrase → backend creates an alert → staff web page shows it and can mark it resolved.
-
-### 1.1 Backend (FastAPI)
-
-Endpoints:
-- `POST /api/alerts` – receive alerts from the room device.
-  - Body: { room_id, resident_name, type ("help"), message, timestamp }.
-- `GET /api/alerts` – list active/recent alerts.
-  - Query params: optional `status` (new/ack/resolved).
-- `POST /api/alerts/{alert_id}/ack` – mark as acknowledged.
-- `POST /api/alerts/{alert_id}/resolve` – mark as resolved.
-
-Storage:
-- SQLite DB with a single `alerts` table.
-
-### 1.2 Resident Device (Web UI)
-
-A simple web page (`/room`) that acts as the "tablet" for **Room 101**:
-
-- Shows:
-  - Resident name.
-  - Big buttons:
-    - "Call for Help".
-    - "Ask a Question".
-- V1 input:
-  - Start with **text input** instead of real voice so we can wire the loop quickly.
-  - Later swap in microphone + speech-to-text.
-
-Behavior:
-- If resident clicks "Call for Help":
-  - POST to `/api/alerts` with type `"help"` and a generic message.
-- If resident types a question:
-  - For now, respond with a canned or simple AI answer (can stub this initially).
-
-### 1.3 Staff Portal (Web UI)
-
-A web page (`/staff`) that shows alerts:
-
-- List of alerts with:
-  - Room, resident, type, time, status.
-- Buttons:
-  - "Acknowledge".
-  - "Resolve".
-
-Implementation:
-- Simple JS polling `/api/alerts` every few seconds.
-- Call the ack/resolve endpoints.
-
-**Deliverable of Phase 1:**
-- Run a single Python app.
-- Open `/room` in one browser ("resident").
-- Open `/staff` in another ("nurse").
-- Click "Call for Help" → see alert appear and handle it.
+**Stack:**
+- Backend: **Python + FastAPI**, async, auto-generated API docs
+- Storage: **SQLite** (single file, zero config)
+- Frontend: **HTML/JS** served by backend, runs on desktop or tablet
+- LLM: **Groq** (llama-3.3-70b-versatile) primary, **OpenRouter** free fallback, canned response safety net
+- TTS: **edge-tts** server-side (AriaNeural voice, mode-aware rate)
+- STT: **Web Speech API** (browser-native, no server dependency)
 
 ---
 
-## Phase 2 – Basic Voice + Modes
+## Phase 1 — Single-Room Prototype ✅ COMPLETE
 
-**Objective:**
-Make the resident UI feel more like a real assistant.
+**Objective:** Full alert loop for one room — resident talks, backend creates alert, staff sees and resolves it.
 
-### 2.1 Voice Input (Prototype)
+### What was built
+- FastAPI backend with full alert CRUD (`POST/GET /api/alerts`, ack, resolve)
+- SQLite `alerts` table with severity levels (emergency/urgent/routine/informational)
+- Resident web UI (`/room/101`) with text chat input
+- Staff portal (`/staff`) with JS polling, alert list, ack/resolve buttons
+- LLM-powered responses via Groq API with intent classification
+- Canned response safety net when LLM is unavailable
 
-- Use Web Speech API (where available) or a simple cloud STT via backend.
-- On "Talk" button:
-  - Start recording.
-  - Convert speech → text.
-  - Show transcribed text and send it to backend for processing.
-
-### 2.2 Help Phrase Detection
-
-Server-side logic:
-- Very simple detection first:
-  - If text contains keywords ("help", "fell", "hurt", "nurse"), create a `help` alert.
-- Log the text in a per-room local file or DB table (for future context), but **don’t expose raw transcripts in staff UI**.
-
-### 2.3 Resident Modes (Standard vs Memory Support)
-
-- Add a `resident_profiles` table or JSON config:
-  - `mode`: "standard" or "memory_support".
-- On `/room` page:
-  - Change prompts / responses based on mode.
-    - Standard: fewer prompts, direct answers.
-    - Memory support: more orientation and reassurance.
+**Deliverable:** Run `uvicorn main:app`, open `/room/101` as resident, `/staff` as nurse. Full loop works.
 
 ---
 
-## Phase 3 – Multi-Room + Cleaner Dashboard
+## Phase 2 — Voice + Modes ✅ COMPLETE
 
-**Objective:**
-Support multiple rooms and a more realistic staff view.
+**Objective:** Make the resident UI feel like a real voice assistant.
 
-Changes:
-- Add `rooms` table with `room_id`, `resident_name`, `mode`.
-- Modify alerts to link to `room_id` foreign key.
-- `/room/{room_id}` route for per-room UI.
-- `/staff` shows alerts grouped by room, with filters.
-
-Optional extras:
-- Simple login for staff (even just a shared password) so it’s not totally open.
-- Basic trends like count of alerts per room for the last 24h.
+### What was built
+- **Voice input** via Web Speech API (browser-native STT)
+- **Voice output** via edge-tts server-side endpoint (`/api/tts`)
+  - AriaNeural voice, mode-aware speech rate (slower for memory_support)
+- **Help phrase detection** — LLM classifies intent with severity
+  - Only emergency/urgent/routine create alerts; informational does not
+- **Resident modes** — standard vs memory_support
+  - memory_support: more reassurance, orientation cues, slower TTS
 
 ---
 
-## Phase 4 – Hardening Toward Pilot
+## Phase 3 — Multi-Room + Staff Auth ✅ COMPLETE
 
-When Phases 1–3 feel solid and you’re happy with the UX:
+**Objective:** Scale to multiple rooms with proper data modeling and access control.
 
-- Improve alert logic (fewer false positives).
-- Add a configuration UI for modes and personality presets.
-- Introduce more explicit privacy indicators in the resident UI.
-- Start aligning the implementation with the pilot-plan requirements (5–10 rooms, metrics, etc.).
+### What was built
+- **`rooms` table** — DB-driven, auto-seeded with 3 residents:
+  - Margaret (101, standard), Harold (102, memory_support), Dorothy (103, standard)
+- **Per-room routing** — `/room/{room_id}` with resident profile loaded from DB
+- **Staff authentication** — shared PIN "1234" (SHA-256), session cookies (8hr expiry)
+- **Staff portal enhancements:**
+  - Room editing (name, resident, mode, personality notes)
+  - Alert notes + attribution (acknowledged_by, resolved_by, notes columns)
+  - Room-based filtering
+- **Alert notes modal** — staff can add context when acknowledging/resolving
 
 ---
 
-This roadmap is deliberately narrow: it gets you from **nothing** to a **working demo** quickly, then adds complexity in layers.
+## Phase 4 — Production Hardening 🔜 NEXT
+
+**Objective:** Make it robust enough for a real pilot deployment.
+
+### 4.1 Security & Auth
+- [ ] Per-user staff accounts (replace shared PIN with individual logins)
+- [ ] Password hashing with bcrypt + salt
+- [ ] HTTPS via Let's Encrypt or self-signed cert
+- [ ] Rate limiting on API endpoints
+- [ ] CSRF protection on forms
+
+### 4.2 Alert Intelligence
+- [ ] Reduce false positives — confidence thresholds on LLM classification
+- [ ] Alert deduplication (same resident, same issue within N minutes)
+- [ ] Escalation rules — unacknowledged urgent alerts re-notify after timeout
+- [ ] Alert history + trends per room (24h/7d charts)
+- [ ] Shift handoff summary — auto-generated report of active/recent alerts
+
+### 4.3 Reliability
+- [ ] Health check endpoint (`/api/health`)
+- [ ] Structured logging (JSON) with log rotation
+- [ ] Graceful LLM degradation — track failure rate, auto-switch providers
+- [ ] Database backups (scheduled SQLite `.backup` command)
+- [ ] Process supervision (systemd unit file or Docker container)
+
+### 4.4 UX Polish
+- [ ] Configuration UI for room modes and personality presets
+- [ ] Privacy indicators in resident UI ("This conversation is private")
+- [ ] Resident photo/avatar support
+- [ ] Larger touch targets for elderly users (accessibility audit)
+- [ ] Night mode with dimmed display and quieter TTS
+
+---
+
+## Phase 5 — Smarter Conversations
+
+**Objective:** Move beyond simple Q&A to contextual, memory-aware dialogue.
+
+### 5.1 Conversation Memory
+- [ ] Per-room conversation history stored in DB (rolling window)
+- [ ] LLM receives recent context for continuity ("You mentioned your daughter earlier...")
+- [ ] Configurable retention period (default 24h, memory_support mode longer)
+
+### 5.2 Proactive Engagement
+- [ ] Time-based check-ins ("Good morning Margaret, did you sleep well?")
+- [ ] Medication reminders (configurable per resident)
+- [ ] Activity suggestions based on time of day and resident preferences
+- [ ] Gentle orientation cues for memory_support ("Today is Tuesday, February 15th")
+
+### 5.3 Richer Intent Detection
+- [ ] Multi-label classification (pain + location, emotional state + urgency)
+- [ ] Sentiment tracking over time (detect mood decline patterns)
+- [ ] Custom keyword/phrase lists per facility
+- [ ] "I've fallen" vs "I fell yesterday" — temporal awareness to avoid false alerts
+
+---
+
+## Phase 6 — Full Duplex Voice (PersonaPlex)
+
+**Objective:** Replace the turn-based voice pipeline with natural, overlapping conversation using NVIDIA PersonaPlex-7B.
+
+### Why
+The current pipeline (Web Speech API → text → LLM → text → edge-tts) creates unnatural pauses. Residents must wait for the system to finish speaking before they can talk. For elderly users, especially those with memory support needs, this feels robotic. Full duplex enables:
+- **Simultaneous listening and speaking** — no awkward silences
+- **Natural interruptions** — resident can interject mid-response
+- **Backchanneling** — "mm-hmm", "I see" while resident talks
+- **Faster response** — 170ms latency vs current multi-second pipeline
+
+### Architecture Change
+```
+CURRENT:  Mic → Web Speech API → text → Groq LLM → text → edge-tts → speaker
+                    (browser)              (cloud)          (server)
+
+TARGET:   Mic → WebSocket audio stream → PersonaPlex-7B → audio stream → speaker
+                    (browser)               (GPU server)        (browser)
+```
+
+### Requirements
+- **NVIDIA GPU with 24GB+ VRAM** (A10G, RTX 3090/4090, or cloud equivalent)
+- PersonaPlex-7B model weights (~14GB)
+- WebSocket-based audio streaming endpoint
+- Voice conditioning prompt (warm, calm, elderly-friendly voice)
+- Role prompt integration with existing resident profiles
+
+### Implementation Plan
+- [ ] Acquire GPU access (local hardware, RunPod, or cloud instance)
+- [ ] Set up PersonaPlex inference server (PyTorch + CUDA)
+- [ ] Build WebSocket audio streaming endpoint (`/ws/voice/{room_id}`)
+- [ ] Create voice conditioning prompts per resident mode
+  - Standard: natural pace, friendly tone
+  - Memory support: slower, warmer, more reassuring
+- [ ] Integrate with existing alert system (PersonaPlex text output → intent classifier)
+- [ ] Browser audio capture via MediaStream API (replace Web Speech API)
+- [ ] Fallback to current pipeline when GPU unavailable
+- [ ] Latency monitoring and quality metrics
+
+### Status
+**BLOCKED** — No NVIDIA GPU available on current hardware (AMD Vega iGPU, 17GB RAM). No free hosted API endpoint exists. Revisit when:
+- Cloud GPU becomes available (RunPod ~$0.40/hr for RTX 4090)
+- Community releases a quantized/CPU-compatible version
+- A free inference endpoint appears on HuggingFace Spaces
+
+### References
+- [NVIDIA PersonaPlex Research](https://research.nvidia.com/labs/adlr/personaplex/)
+- [Model on HuggingFace](https://huggingface.co/nvidia/personaplex-7b-v1)
+- [GitHub Repository](https://github.com/NVIDIA/personaplex)
+- [PersonaPlex Paper (PDF)](https://research.nvidia.com/labs/adlr/files/personaplex/personaplex_preprint.pdf)
+
+---
+
+## Phase 7 — Pilot Deployment
+
+**Objective:** Deploy to a real nursing home wing (5-10 rooms) and validate with staff and residents.
+
+### 7.1 Infrastructure
+- [ ] Dedicated server or cloud instance (FastAPI + PersonaPlex if GPU available)
+- [ ] Tablets provisioned per room (locked to Room Companion app)
+- [ ] Network setup (isolated VLAN for privacy, local-only traffic option)
+- [ ] Automated deployment (Docker Compose or Ansible)
+
+### 7.2 Compliance & Privacy
+- [ ] Data retention policy (configurable per facility)
+- [ ] Consent workflow for residents/families
+- [ ] Audit log for all staff actions
+- [ ] No raw transcript exposure — only classified alerts reach staff
+- [ ] Data export/deletion capability (resident discharge)
+
+### 7.3 Metrics & Evaluation
+- [ ] Alert response time tracking (created → acknowledged → resolved)
+- [ ] False positive rate per room
+- [ ] Resident engagement metrics (conversations/day, avg duration)
+- [ ] Staff satisfaction survey integration
+- [ ] Weekly automated report generation
+
+### 7.4 Training & Onboarding
+- [ ] Staff training guide (how to use portal, respond to alerts, edit rooms)
+- [ ] Resident introduction protocol (gentle, opt-in, family involvement)
+- [ ] IT setup guide (network, tablets, server)
+- [ ] Troubleshooting runbook
+
+---
+
+## Status Summary
+
+| Phase | Status | Key Milestone |
+|-------|--------|---------------|
+| 1. Single-Room Prototype | ✅ Complete | Full alert loop working |
+| 2. Voice + Modes | ✅ Complete | Web Speech + edge-tts + LLM classification |
+| 3. Multi-Room + Auth | ✅ Complete | 3 rooms, staff PIN, alert notes |
+| 4. Production Hardening | 🔜 Next | Per-user auth, HTTPS, monitoring |
+| 5. Smarter Conversations | 📋 Planned | Context memory, proactive engagement |
+| 6. Full Duplex Voice | 🚫 Blocked | Needs NVIDIA GPU for PersonaPlex-7B |
+| 7. Pilot Deployment | 📋 Planned | Real facility, 5-10 rooms |

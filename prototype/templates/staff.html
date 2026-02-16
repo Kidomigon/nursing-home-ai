@@ -18,6 +18,9 @@
       </div>
       <div class="staff-identity">
         <span class="staff-name-badge">&#x1F464; {{ staff_name }}</span>
+        {% if staff_role == 'admin' %}
+        <a href="/staff/manage" class="manage-link">Manage Staff</a>
+        {% endif %}
         <a href="/staff/logout" class="logout-link">Sign out</a>
       </div>
     </header>
@@ -162,6 +165,7 @@
     <div class="modal-card">
       <h3 id="notes-modal-title">Add Notes</h3>
       <form id="notes-form" method="post">
+        <input type="hidden" name="csrf" value="{{ csrf_token }}" />
         <textarea name="notes" id="notes-textarea" rows="3" placeholder="Optional notes about this alert..."></textarea>
         <div class="modal-actions">
           <button type="button" class="btn-action" onclick="closeNotesModal()">Cancel</button>
@@ -176,6 +180,7 @@
     <div class="modal-card">
       <h3>Edit Room</h3>
       <form id="edit-form" method="post">
+        <input type="hidden" name="csrf" value="{{ csrf_token }}" />
         <label for="edit-name">Resident Name</label>
         <input type="text" id="edit-name" name="resident_name" required />
 

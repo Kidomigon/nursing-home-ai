@@ -5,39 +5,55 @@ Features:
 - Intent classification with severity levels
 - Real-time alert management for staff
 - DB-driven multi-room support with resident profiles
-- Staff authentication (shared PIN + name)
+- Per-user staff authentication (bcrypt) with role-based access
+- CSRF protection on all staff POST endpoints
+- Rate limiting on login, chat, and TTS
 - Alert notes and attribution
 - Voice input/output (handled client-side)
 """
 
 import asyncio
-import hashlib
-import secrets
+import os
+import subprocess
 from datetime import datetime
 import datetime as dt
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, Request, Form, Cookie
+from fastapi import FastAPI, Request, Form, Cookie, Depends, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import sqlite3
 
 from llm import load_api_keys, chat, classify, get_greeting, ClassificationResult
+import auth
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "alerts.db"
 
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(title="Room Companion")
+app.state.limiter = limiter
+
+# Rate limit error handler
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"error": "Too many requests. Please try again later."},
+    )
 
 # Static files & templates
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
-# Staff PIN — SHA-256 hash of "1234" (change for production)
-STAFF_PIN_HASH = hashlib.sha256("1234".encode()).hexdigest()
 SESSION_EXPIRY_HOURS = 8
 
 
@@ -99,6 +115,22 @@ def init_db():
         """
     )
 
+    # Phase 4a: staff accounts table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS staff (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'nurse',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            last_login_at TEXT
+        )
+        """
+    )
+
     # Migration: add severity column if missing (existing DBs)
     cursor.execute("PRAGMA table_info(alerts)")
     columns = [row[1] for row in cursor.fetchall()]
@@ -117,6 +149,14 @@ def init_db():
     if "response" not in columns:
         cursor.execute("ALTER TABLE questions ADD COLUMN response TEXT")
 
+    # Migration: add staff_id and csrf_token to sessions
+    cursor.execute("PRAGMA table_info(sessions)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "staff_id" not in columns:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN staff_id INTEGER")
+    if "csrf_token" not in columns:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN csrf_token TEXT")
+
     # Auto-seed rooms from defaults if table is empty
     cursor.execute("SELECT COUNT(*) FROM rooms")
     if cursor.fetchone()[0] == 0:
@@ -129,6 +169,19 @@ def init_db():
             "INSERT INTO rooms (room_id, resident_name, mode) VALUES (?, ?, ?)",
             defaults,
         )
+
+    # Auto-seed admin account if staff table is empty
+    cursor.execute("SELECT COUNT(*) FROM staff")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            """INSERT INTO staff (username, display_name, password_hash, role, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("admin", "Admin", auth.hash_password("admin1234"), "admin",
+             datetime.utcnow().isoformat()),
+        )
+
+    # Clear stale sessions without staff_id (from old PIN-based auth)
+    cursor.execute("DELETE FROM sessions WHERE staff_id IS NULL")
 
     conn.commit()
     conn.close()
@@ -156,59 +209,57 @@ def get_rooms() -> dict:
 
 
 # ==========================
-# Auth helpers
+# Auth dependencies
 # ==========================
 
-def create_session(staff_name: str) -> str:
-    """Create a new session token for a staff member."""
-    token = secrets.token_urlsafe(32)
-    now = datetime.utcnow()
-    expires = now + dt.timedelta(hours=SESSION_EXPIRY_HOURS)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO sessions (token, staff_name, created_at, expires_at) VALUES (?, ?, ?, ?)",
-        (token, staff_name, now.isoformat(), expires.isoformat()),
-    )
-    conn.commit()
-    conn.close()
-    return token
-
-
-def get_session(token: Optional[str]) -> Optional[str]:
-    """Validate a session token and return the staff name, or None if invalid/expired."""
-    if not token:
+async def get_current_staff(session_token: Optional[str] = Cookie(None)):
+    """FastAPI dependency: validate session and return staff info dict or None."""
+    if not session_token:
         return None
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT staff_name, expires_at FROM sessions WHERE token = ?", (token,)
-    )
-    row = cursor.fetchone()
+    session = auth.get_session(conn, session_token)
     conn.close()
-    if not row:
-        return None
-    if datetime.fromisoformat(row["expires_at"]) < datetime.utcnow():
-        # Expired — clean up
-        conn = get_db_connection()
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-        conn.commit()
-        conn.close()
-        return None
-    return row["staff_name"]
+    return session
 
 
-def delete_session(token: str):
-    """Delete a session token."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-    conn.commit()
-    conn.close()
+async def require_staff(staff=Depends(get_current_staff)):
+    """Dependency that redirects to login if not authenticated."""
+    if not staff:
+        raise HTTPException(status_code=303, headers={"Location": "/staff/login"})
+    return staff
 
 
-def verify_pin(pin: str) -> bool:
-    """Check if the provided PIN matches the stored hash."""
-    return hashlib.sha256(pin.encode()).hexdigest() == STAFF_PIN_HASH
+async def verify_csrf(request: Request, staff=Depends(get_current_staff)):
+    """Verify CSRF token on POST requests. Returns staff dict."""
+    if not staff:
+        raise HTTPException(status_code=303, headers={"Location": "/staff/login"})
+    form = await request.form()
+    if form.get("csrf") != staff.get("csrf_token"):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    return staff
+
+
+# ==========================
+# HTTPS cert generation
+# ==========================
+
+def ensure_certs():
+    """Generate self-signed certs if they don't exist."""
+    cert_dir = BASE_DIR / "certs"
+    key_path = cert_dir / "server.key"
+    crt_path = cert_dir / "server.crt"
+
+    if key_path.exists() and crt_path.exists():
+        return
+
+    os.makedirs(cert_dir, exist_ok=True)
+    # Use clean environment to avoid LD_LIBRARY_PATH conflicts
+    clean_env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", str(key_path), "-out", str(crt_path),
+        "-days", "365", "-nodes", "-subj", "/CN=localhost"
+    ], check=True, env=clean_env)
 
 
 # Run at startup
@@ -333,7 +384,6 @@ def resolve_alert(alert_id: int, staff_name: Optional[str] = None, notes: Option
     now_str = datetime.utcnow().isoformat()
     conn = get_db_connection()
     cursor = conn.cursor()
-    # Append new notes to existing if both present
     if notes:
         cursor.execute("SELECT notes FROM alerts WHERE id = ?", (alert_id,))
         existing = cursor.fetchone()
@@ -424,12 +474,9 @@ def get_room(room_id: str):
 # ==========================
 
 @app.post("/api/room/{room_id}/chat", response_model=ChatResponse)
-async def room_chat(room_id: str, req: ChatRequest):
-    """Send a message to the Room Companion and get a response.
-
-    Runs LLM chat and classification in parallel.
-    Creates alert if classification detects a help request.
-    """
+@limiter.limit("20/minute")
+async def room_chat(request: Request, room_id: str, req: ChatRequest):
+    """Send a message to the Room Companion and get a response."""
     rooms = get_rooms()
     profile = rooms.get(room_id)
     if not profile:
@@ -442,12 +489,10 @@ async def room_chat(room_id: str, req: ChatRequest):
     if not user_message:
         return ChatResponse(response="I didn't catch that. Could you say that again?", alert_created=False)
 
-    # Run chat and classify in parallel
     chat_task = chat(room_id, resident_name, mode, user_message)
     classify_task = classify(user_message)
     response_text, classification = await asyncio.gather(chat_task, classify_task)
 
-    # Log the question + response
     now_str = datetime.utcnow().isoformat()
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -457,7 +502,6 @@ async def room_chat(room_id: str, req: ChatRequest):
         (room_id, resident_name, user_message, response_text, now_str),
     )
 
-    # Create alert if help request detected
     alert_created = False
     severity = None
     if classification.is_help_request and classification.confidence >= 0.5 and classification.severity != "informational":
@@ -481,7 +525,8 @@ async def room_chat(room_id: str, req: ChatRequest):
 # ==========================
 
 @app.post("/api/tts")
-async def text_to_speech(req: TTSRequest):
+@limiter.limit("30/minute")
+async def text_to_speech(request: Request, req: TTSRequest):
     """Generate speech audio from text using Microsoft Edge TTS."""
     import edge_tts
 
@@ -514,21 +559,52 @@ async def staff_login_page(request: Request, error: Optional[str] = None):
 
 
 @app.post("/staff/login")
+@limiter.limit("5/minute")
 async def staff_login(
     request: Request,
-    staff_name: str = Form(...),
-    pin: str = Form(...),
+    username: str = Form(...),
+    password: str = Form(...),
 ):
-    """Handle staff login — validate PIN and create session."""
-    staff_name = staff_name.strip()
-    if not staff_name or not verify_pin(pin):
+    """Handle staff login — validate credentials and create session."""
+    username = username.strip()
+    if not username:
         return templates.TemplateResponse(
             "staff_login.html",
-            {"request": request, "error": "Invalid name or PIN."},
+            {"request": request, "error": "Please enter your username."},
             status_code=401,
         )
 
-    token = create_session(staff_name)
+    conn = get_db_connection()
+    staff_record = auth.get_staff_by_username(conn, username)
+
+    if not staff_record or not staff_record["is_active"]:
+        conn.close()
+        return templates.TemplateResponse(
+            "staff_login.html",
+            {"request": request, "error": "Invalid username or password."},
+            status_code=401,
+        )
+
+    if not auth.verify_password(password, staff_record["password_hash"]):
+        conn.close()
+        return templates.TemplateResponse(
+            "staff_login.html",
+            {"request": request, "error": "Invalid username or password."},
+            status_code=401,
+        )
+
+    token, csrf_token = auth.create_session(
+        conn, staff_record["id"], staff_record["display_name"], staff_record["role"]
+    )
+
+    # Update last login
+    conn.execute(
+        "UPDATE staff SET last_login_at = ? WHERE id = ?",
+        (datetime.utcnow().isoformat(), staff_record["id"]),
+    )
+    conn.commit()
+    conn.close()
+
     response = RedirectResponse(url="/staff", status_code=303)
     response.set_cookie(
         key="session_token",
@@ -544,7 +620,9 @@ async def staff_login(
 async def staff_logout(session_token: Optional[str] = Cookie(None)):
     """Log out staff — delete session and redirect to login."""
     if session_token:
-        delete_session(session_token)
+        conn = get_db_connection()
+        auth.delete_session(conn, session_token)
+        conn.close()
     response = RedirectResponse(url="/staff/login", status_code=303)
     response.delete_cookie("session_token")
     return response
@@ -604,11 +682,10 @@ async def staff_view(
     room_id: Optional[str] = None,
     severity: Optional[str] = None,
     status: Optional[str] = None,
-    session_token: Optional[str] = Cookie(None),
+    staff=Depends(get_current_staff),
 ):
     """Staff portal — alert dashboard with room status cards. Requires auth."""
-    staff_name = get_session(session_token)
-    if not staff_name:
+    if not staff:
         return RedirectResponse(url="/staff/login", status_code=303)
 
     rooms = get_rooms()
@@ -696,7 +773,9 @@ async def staff_view(
             "filter_room": room_id or "",
             "filter_severity": severity or "",
             "filter_status": status or "",
-            "staff_name": staff_name,
+            "staff_name": staff["staff_name"],
+            "staff_role": staff["role"],
+            "csrf_token": staff["csrf_token"],
         }
     )
 
@@ -705,13 +784,15 @@ async def staff_view(
 async def staff_ack_alert(
     alert_id: int,
     notes: str = Form(""),
-    session_token: Optional[str] = Cookie(None),
+    csrf: str = Form(""),
+    staff=Depends(get_current_staff),
 ):
     """Acknowledge an alert with optional notes."""
-    staff_name = get_session(session_token)
-    if not staff_name:
+    if not staff:
         return RedirectResponse(url="/staff/login", status_code=303)
-    acknowledge_alert(alert_id, staff_name=staff_name, notes=notes.strip() or None)
+    if csrf != staff.get("csrf_token"):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    acknowledge_alert(alert_id, staff_name=staff["staff_name"], notes=notes.strip() or None)
     return RedirectResponse(url="/staff", status_code=303)
 
 
@@ -719,13 +800,15 @@ async def staff_ack_alert(
 async def staff_resolve_alert(
     alert_id: int,
     notes: str = Form(""),
-    session_token: Optional[str] = Cookie(None),
+    csrf: str = Form(""),
+    staff=Depends(get_current_staff),
 ):
     """Resolve an alert with optional notes."""
-    staff_name = get_session(session_token)
-    if not staff_name:
+    if not staff:
         return RedirectResponse(url="/staff/login", status_code=303)
-    resolve_alert(alert_id, staff_name=staff_name, notes=notes.strip() or None)
+    if csrf != staff.get("csrf_token"):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    resolve_alert(alert_id, staff_name=staff["staff_name"], notes=notes.strip() or None)
     return RedirectResponse(url="/staff", status_code=303)
 
 
@@ -734,12 +817,14 @@ async def staff_edit_room(
     room_id: str,
     resident_name: str = Form(...),
     mode: str = Form(...),
-    session_token: Optional[str] = Cookie(None),
+    csrf: str = Form(""),
+    staff=Depends(get_current_staff),
 ):
     """Edit a room's resident name or care mode."""
-    staff_name = get_session(session_token)
-    if not staff_name:
+    if not staff:
         return RedirectResponse(url="/staff/login", status_code=303)
+    if csrf != staff.get("csrf_token"):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -750,6 +835,118 @@ async def staff_edit_room(
     conn.commit()
     conn.close()
     return RedirectResponse(url="/staff", status_code=303)
+
+
+# ==========================
+# Staff management (admin only)
+# ==========================
+
+@app.get("/staff/manage", response_class=HTMLResponse)
+async def staff_manage_page(request: Request, staff=Depends(get_current_staff)):
+    """Staff account management — admin only."""
+    if not staff:
+        return RedirectResponse(url="/staff/login", status_code=303)
+    if staff["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    conn = get_db_connection()
+    staff_list = auth.list_staff(conn)
+    conn.close()
+
+    return templates.TemplateResponse(
+        "staff_manage.html", {
+            "request": request,
+            "staff_list": staff_list,
+            "staff_name": staff["staff_name"],
+            "staff_role": staff["role"],
+            "csrf_token": staff["csrf_token"],
+        }
+    )
+
+
+@app.post("/staff/manage/create")
+async def staff_manage_create(
+    request: Request,
+    username: str = Form(...),
+    display_name: str = Form(...),
+    password: str = Form(...),
+    role: str = Form("nurse"),
+    csrf: str = Form(""),
+    staff=Depends(get_current_staff),
+):
+    """Create a new staff account — admin only."""
+    if not staff:
+        return RedirectResponse(url="/staff/login", status_code=303)
+    if staff["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if csrf != staff.get("csrf_token"):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+
+    if role not in ("nurse", "admin", "supervisor"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    conn = get_db_connection()
+    existing = auth.get_staff_by_username(conn, username)
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    auth.create_staff(conn, username, display_name, password, role)
+    conn.close()
+    return RedirectResponse(url="/staff/manage", status_code=303)
+
+
+@app.post("/staff/manage/{staff_id}/edit")
+async def staff_manage_edit(
+    staff_id: int,
+    display_name: str = Form(...),
+    role: str = Form(...),
+    password: str = Form(""),
+    csrf: str = Form(""),
+    staff=Depends(get_current_staff),
+):
+    """Edit a staff account — admin only."""
+    if not staff:
+        return RedirectResponse(url="/staff/login", status_code=303)
+    if staff["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if csrf != staff.get("csrf_token"):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+
+    if role not in ("nurse", "admin", "supervisor"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    conn = get_db_connection()
+    fields = {"display_name": display_name.strip(), "role": role}
+    if password.strip():
+        fields["password"] = password.strip()
+    auth.update_staff(conn, staff_id, **fields)
+    conn.close()
+    return RedirectResponse(url="/staff/manage", status_code=303)
+
+
+@app.post("/staff/manage/{staff_id}/deactivate")
+async def staff_manage_deactivate(
+    staff_id: int,
+    csrf: str = Form(""),
+    staff=Depends(get_current_staff),
+):
+    """Deactivate a staff account — admin only."""
+    if not staff:
+        return RedirectResponse(url="/staff/login", status_code=303)
+    if staff["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if csrf != staff.get("csrf_token"):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+
+    # Prevent self-deactivation
+    if staff_id == staff["staff_id"]:
+        raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
+
+    conn = get_db_connection()
+    auth.deactivate_staff(conn, staff_id)
+    conn.close()
+    return RedirectResponse(url="/staff/manage", status_code=303)
 
 
 @app.get("/")

@@ -1155,6 +1155,143 @@ body {
 }
 
 /* ================================================================
+   STAFF MANAGEMENT PAGE
+   ================================================================ */
+
+.manage-link {
+  color: var(--blue);
+  text-decoration: none;
+  font-size: 0.8rem;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--blue-muted);
+  transition: background 0.15s, color 0.15s;
+}
+
+.manage-link:hover {
+  background: var(--blue-bg);
+}
+
+.back-link {
+  color: var(--blue);
+  text-decoration: none;
+  font-size: 0.8rem;
+}
+
+.back-link:hover { text-decoration: underline; }
+
+.manage-toolbar {
+  margin-bottom: var(--sp-5);
+}
+
+.create-staff-btn {
+  padding: var(--sp-2) var(--sp-4) !important;
+  font-size: 0.85rem !important;
+}
+
+.staff-table-wrap {
+  overflow-x: auto;
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+
+.staff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.staff-table th {
+  background: var(--bg);
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: var(--sp-3) var(--sp-4);
+  text-align: left;
+  border-bottom: 2px solid var(--gray-light);
+}
+
+.staff-table td {
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--gray-light);
+  vertical-align: middle;
+}
+
+.staff-table tr:last-child td {
+  border-bottom: none;
+}
+
+.staff-table .inactive-row {
+  opacity: 0.5;
+}
+
+.mono-cell {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.role-badge {
+  display: inline-block;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: var(--radius-lg);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.role-badge.role-admin      { background: #FFF5F5; color: var(--red); }
+.role-badge.role-supervisor  { background: var(--orange-light); color: var(--orange); }
+.role-badge.role-nurse       { background: var(--blue-bg); color: var(--blue); }
+
+.status-active {
+  color: var(--green);
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+
+.status-inactive {
+  color: var(--text-light);
+  font-size: 0.8rem;
+}
+
+.action-cell {
+  white-space: nowrap;
+}
+
+.action-cell .btn-action {
+  margin-right: var(--sp-1);
+}
+
+.deactivate-btn:hover:not(:disabled) {
+  background: var(--red-light) !important;
+  border-color: var(--red) !important;
+  color: var(--red) !important;
+}
+
+.text-muted {
+  color: var(--text-light);
+  font-size: 0.8rem;
+}
+
+.disabled-input {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.optional-hint {
+  font-weight: 400;
+  font-size: 0.65rem;
+  color: var(--text-light);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+
+/* ================================================================
    Responsive
    ================================================================ */
 
